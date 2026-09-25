@@ -169,10 +169,10 @@ jobs:
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
             echo "| 内核 | $SOURCE_REPO@$SOURCE_REF ($SOURCE_COMMIT) |"
-            echo "| 版本 | $VERSION（$VERSION_FROM） |"
-            echo "| Apple 客户端 | $CLIENT_COMMIT（$CLIENT_FROM） |"
+            echo "| 版本 | ${VERSION}（${VERSION_FROM}） |"
+            echo "| Apple 客户端 | ${CLIENT_COMMIT}（${CLIENT_FROM}） |"
             echo "| 子模块原指针 | $POINTER |"
-            echo "| 运行器 | $RUNNER_LABEL，$XCODE_VERSION |"
+            echo "| 运行器 | ${RUNNER_LABEL}，${XCODE_VERSION} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set tag
