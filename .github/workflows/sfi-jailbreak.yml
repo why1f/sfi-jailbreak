@@ -1,0 +1,292 @@
+name: Build SFI (jailbreak)
+
+# 越狱版 SFI（sing-box iOS 客户端 .deb）构建工作流。
+# 这个分支只放工作流，不含 sing-box 源码，不需要也不要 Sync fork。
+# 运行时直接从 source_repo 拉取内核源码，并自动匹配同版本的 Apple 客户端：
+# 上游只在名为 testing 的分支上把客户端切到 dev 分支，风大的分支名不同，
+# 所以这里改为查找 sing-box-for-apple 中的 "Bump version <版本号>" 提交。
+# 编译用的运行器跟随上游 build.yml 中 Apple 构建的 runs-on（例如 xcode-27），
+# 因为新版客户端代码需要对应版本的 Xcode 才能编译。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "内核源码仓库"
+        required: true
+        default: "reF1nd/sing-box"
+        type: string
+      source_ref:
+        description: "分支、标签或提交，例如 reF1nd-testing 或 v1.15.0-alpha.8-reF1nd"
+        required: true
+        default: "reF1nd-testing"
+        type: string
+      version:
+        description: "版本号，留空自动识别，例如 1.15.0-alpha.8"
+        required: false
+        type: string
+      apple_ref:
+        description: "Apple 客户端提交或分支，留空自动匹配"
+        required: false
+        type: string
+      runner:
+        description: "运行器标签，留空跟随上游，例如 xcode-27"
+        required: false
+        type: string
+      release:
+        description: "发布到本仓库 Releases"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.source_repo }}-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner:
+    name: Detect runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.detect.outputs.label }}
+    steps:
+      - name: Detect Apple runner
+        id: detect
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_RUNNER: ${{ inputs.runner }}
+        run: |-
+          LABEL="$INPUT_RUNNER"
+          if [ -z "$LABEL" ]; then
+            curl -fsSL "https://raw.githubusercontent.com/$SOURCE_REPO/$SOURCE_REF/.github/workflows/build.yml" -o build.yml || true
+            LABEL=$(awk '/^  build_apple:/ { found = 1 } found && /runs-on:/ { print; exit }' build.yml 2>/dev/null | grep -oE "'(macos|xcode)-[0-9]+'" | tr -d "'" | head -n 1 || true)
+          fi
+          LABEL="${LABEL:-xcode-27}"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "runner: $LABEL"
+
+  build:
+    name: SFI ${{ inputs.source_repo }}@${{ inputs.source_ref }}
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.label }}
+    permissions:
+      contents: write
+    env:
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      INPUT_VERSION: ${{ inputs.version }}
+      APPLE_REF: ${{ inputs.apple_ref }}
+      RUNNER_LABEL: ${{ needs.runner.outputs.label }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve version
+        id: meta
+        run: |-
+          norm() { sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?).*$/\1/p'; }
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION=$(printf '%s\n' "$INPUT_VERSION" | norm)
+            VERSION_FROM="手动指定"
+          else
+            TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)
+            FROM_TAG=$(printf '%s\n' "$TAG" | norm)
+            FROM_LOG=$(awk '/^#+ +[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)? *$/ { sub(/^#+ +/, ""); sub(/ *$/, ""); print; exit }' docs/changelog.md 2>/dev/null || true)
+            VERSION=$(printf '%s\n%s\n' "$FROM_TAG" "$FROM_LOG" | sed '/^$/d' | sort -V 2>/dev/null | tail -n 1)
+            [ -n "$VERSION" ] || VERSION="${FROM_LOG:-$FROM_TAG}"
+            VERSION_FROM="标签 ${TAG:-无}，changelog ${FROM_LOG:-无}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::无法识别版本号，请在 version 中手动填写，例如 1.15.0-alpha.8"
+            exit 1
+          fi
+          SUFFIX="${SOURCE_REPO%%/*}"
+          GO_VERSION=$(awk 'match($0, /go-version:[[:space:]]*"?[0-9]+\.[0-9]+(\.[0-9]+)?/) { v = substr($0, RSTART, RLENGTH); sub(/^go-version:[[:space:]]*"?/, "", v); print v; exit }' .github/workflows/build.yml 2>/dev/null || true)
+          {
+            echo "VERSION=$VERSION"
+            echo "VERSION_FROM=$VERSION_FROM"
+            echo "SUFFIX=$SUFFIX"
+            echo "ASSET=SFI-$VERSION-$SUFFIX-iphoneos-arm64"
+            echo "RELEASE_TAG=sfi-$VERSION-$SUFFIX"
+            echo "SOURCE_COMMIT=$(git rev-parse --short HEAD)"
+          } >> "$GITHUB_ENV"
+          echo "go_version=${GO_VERSION:-stable}" >> "$GITHUB_OUTPUT"
+          echo "version: $VERSION ($VERSION_FROM)"
+          echo "go: ${GO_VERSION:-stable}"
+
+      - name: Select Apple client
+        run: |-
+          git submodule update --init --recursive clients/apple
+          cd clients/apple
+          POINTER=$(git log -1 --format='%h %s')
+          git fetch --quiet origin dev main
+          if [ -n "$APPLE_REF" ]; then
+            git fetch --quiet origin "$APPLE_REF" || true
+            if git rev-parse --verify --quiet "refs/remotes/origin/$APPLE_REF" >/dev/null; then
+              TARGET="origin/$APPLE_REF"
+            else
+              TARGET="$APPLE_REF"
+            fi
+            CLIENT_FROM="手动指定 $APPLE_REF"
+          else
+            TARGET=$(git log --format='%H%x09%s' origin/dev origin/main | awk -F '\t' -v want="Bump version $VERSION" '!found && $2 == want { found = $1 } END { if (found) print found }')
+            if [ -n "$TARGET" ]; then
+              CLIENT_FROM="匹配 Bump version $VERSION"
+            else
+              case "$VERSION" in
+                *-*)
+                  TARGET=origin/dev
+                  CLIENT_FROM="没有 $VERSION 的版本提交，改用 dev 分支最新"
+                  echo "::warning::sing-box-for-apple 中没有 'Bump version $VERSION' 提交，改用 dev 分支最新提交"
+                  ;;
+                *)
+                  TARGET=HEAD
+                  CLIENT_FROM="沿用子模块指针"
+                  ;;
+              esac
+            fi
+          fi
+          git checkout --quiet --detach "$TARGET"
+          git submodule update --init --recursive
+          CLIENT_COMMIT=$(git log -1 --format='%h %s')
+          XCODE_VERSION=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')
+          {
+            echo "CLIENT_COMMIT=$CLIENT_COMMIT"
+            echo "CLIENT_FROM=$CLIENT_FROM"
+          } >> "$GITHUB_ENV"
+          echo "submodule pointer: $POINTER"
+          echo "apple client:      $CLIENT_COMMIT ($CLIENT_FROM)"
+          echo "toolchain:         $RUNNER_LABEL, $XCODE_VERSION"
+          {
+            echo "### SFI $VERSION"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 内核 | $SOURCE_REPO@$SOURCE_REF ($SOURCE_COMMIT) |"
+            echo "| 版本 | $VERSION（$VERSION_FROM） |"
+            echo "| Apple 客户端 | $CLIENT_COMMIT（$CLIENT_FROM） |"
+            echo "| 子模块原指针 | $POINTER |"
+            echo "| 运行器 | $RUNNER_LABEL，$XCODE_VERSION |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set tag
+        run: |-
+          git for-each-ref --format='delete %(refname)' refs/tags | git update-ref --stdin
+          git tag "v$VERSION"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.meta.outputs.go_version }}
+          cache: false
+
+      - name: Patch Go for iOS
+        run: |-
+          if [ -f .github/patch_go_for_ios.sh ]; then
+            bash .github/patch_go_for_ios.sh
+          fi
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-macos-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-macos-
+
+      - name: Cache Go build
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/go-build
+          key: sfi-go-build-${{ env.RUNNER_LABEL }}-${{ steps.meta.outputs.go_version }}-${{ hashFiles('go.sum') }}
+          restore-keys: sfi-go-build-${{ env.RUNNER_LABEL }}-${{ steps.meta.outputs.go_version }}-
+
+      - name: Build Libbox
+        env:
+          GOTOOLCHAIN: local
+        run: |-
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
+          rm -rf clients/apple/Libbox.xcframework
+          if [ -d cmd/internal/merge_apple_xcframework ]; then
+            go run ./cmd/internal/merge_apple_xcframework -output clients/apple/Libbox.xcframework Libbox.xcframework
+          else
+            mv Libbox.xcframework clients/apple/Libbox.xcframework
+          fi
+
+      - name: Update Apple project version
+        run: go run -v ./cmd/internal/update_apple_version --ci
+
+      - name: Install jailbreak packaging tools
+        run: brew install dpkg ldid
+
+      - name: Cache Swift packages
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/SourcePackages
+          key: sfi-spm-${{ hashFiles('clients/apple/sing-box.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: sfi-spm-
+
+      - name: Cache Xcode build data
+        uses: actions/cache@v5
+        with:
+          path: clients/apple/build/jailbreak/DerivedData
+          key: sfi-derived-data-${{ env.RUNNER_LABEL }}-${{ hashFiles('clients/apple/sing-box.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ env.SOURCE_COMMIT }}
+          restore-keys: |
+            sfi-derived-data-${{ env.RUNNER_LABEL }}-${{ hashFiles('clients/apple/sing-box.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
+            sfi-derived-data-${{ env.RUNNER_LABEL }}-
+
+      - name: Build jailbreak package
+        env:
+          XCODEBUILD_CLONED_SOURCE_PACKAGES_DIR_PATH: ${{ runner.temp }}/SourcePackages
+        run: |-
+          make -C clients/apple build_ios_deb
+          DEB="clients/apple/build/jailbreak/SFI-$VERSION-iphoneos-arm64.deb"
+          if [ ! -f "$DEB" ]; then
+            DEB=$(ls -t clients/apple/build/jailbreak/SFI-*-iphoneos-arm64.deb | head -n 1)
+          fi
+          mkdir -p dist
+          cp "$DEB" "dist/$ASSET.deb"
+          SHA256=$(shasum -a 256 "dist/$ASSET.deb" | cut -d ' ' -f 1)
+          echo "DEB_SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "$SHA256  $ASSET.deb"
+          {
+            echo
+            echo "产物：\`$ASSET.deb\`"
+            echo
+            echo "SHA-256：\`$SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune Swift package repositories
+        run: rm -rf "$RUNNER_TEMP/SourcePackages/repositories"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ASSET }}
+          path: dist/*.deb
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          NOTES=$(printf '内核：%s@%s (%s)\n\nApple 客户端：%s（%s）\n\nSHA-256：%s\n' \
+            "$SOURCE_REPO" "$SOURCE_REF" "$SOURCE_COMMIT" "$CLIENT_COMMIT" "$CLIENT_FROM" "$DEB_SHA256")
+          PRERELEASE=""
+          case "$VERSION" in *-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/$ASSET.deb" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "dist/$ASSET.deb" --target "$GITHUB_SHA" $PRERELEASE \
+              --title "SFI $VERSION ($SUFFIX)" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
+          fi
