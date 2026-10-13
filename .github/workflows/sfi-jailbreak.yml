@@ -175,43 +175,6 @@ jobs:
             echo "| 运行器 | ${RUNNER_LABEL}，${XCODE_VERSION} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Patch Apple client for core-only API
-        run: |-
-          CORE_PLATFORM=experimental/libbox/platform.go
-          SWIFT=clients/apple/Library/Network/ExtensionPlatformInterface.swift
-          if ! grep -q 'CreateAutoRedirectListener' "$CORE_PLATFORM"; then
-            echo "core does not declare CreateAutoRedirectListener, no patch needed"
-            exit 0
-          fi
-          if grep -q 'func createAutoRedirectListener' "$SWIFT"; then
-            echo "client already implements createAutoRedirectListener"
-            exit 0
-          fi
-          if ! grep -q '    public func createAutoRedirect(' "$SWIFT"; then
-            echo "::error::insertion point 'createAutoRedirect' not found in $SWIFT"
-            exit 1
-          fi
-          STUB="$RUNNER_TEMP/auto-redirect-listener.swift"
-          {
-            echo '    public func createAutoRedirectListener(_: Bool) throws -> Int32 {'
-            echo '        // 风大内核为 Linux/Android 自动重定向新增的方法，Apple 平台不会调用，'
-            echo '        // 与上游的 createAutoRedirect 一样直接抛错。'
-            echo '        throw NSError(domain: "ExtensionPlatformInterface", code: -1, userInfo: ['
-            echo '            NSLocalizedDescriptionKey: "auto redirect is not supported on Apple platforms",'
-            echo '        ])'
-            echo '    }'
-            echo
-          } > "$STUB"
-          [ -s "$STUB" ] || { echo "::error::failed to write the stub file"; exit 1; }
-          export STUB
-          awk 'BEGIN { while ((getline line < ENVIRON["STUB"]) > 0) stub = stub line "\n" }
-               !inserted && index($0, "    public func createAutoRedirect(") == 1 { printf "%s", stub; inserted = 1 }
-               { print }' "$SWIFT" > "$SWIFT.patched"
-          mv "$SWIFT.patched" "$SWIFT"
-          grep -q 'func createAutoRedirectListener' "$SWIFT" || { echo "::error::patch failed"; exit 1; }
-          echo "patched $SWIFT"
-          echo "CLIENT_PATCHED=createAutoRedirectListener" >> "$GITHUB_ENV"
-
       - name: Set tag
         run: |-
           git for-each-ref --format='delete %(refname)' refs/tags | git update-ref --stdin
@@ -253,7 +216,7 @@ jobs:
           HDR=$(ls Libbox.xcframework/*/Libbox.framework/Headers/Libbox.objc.h 2>/dev/null | head -n 1)
           if [ -n "$HDR" ]; then
             echo "binding header: $HDR"
-            grep -n 'createAutoRedirectListener' "$HDR" || echo "(binding has no createAutoRedirectListener declaration)"
+            grep -nF 'createAutoRedirectListener' "$HDR" || echo "(binding has no createAutoRedirectListener declaration)"
           fi
           rm -rf clients/apple/Libbox.xcframework
           if [ -d cmd/internal/merge_apple_xcframework ]; then
@@ -261,6 +224,52 @@ jobs:
           else
             mv Libbox.xcframework clients/apple/Libbox.xcframework
           fi
+
+      - name: Patch Apple client for core-only API
+        run: |-
+          HDR=$(ls Libbox.xcframework/*/Libbox.framework/Headers/Libbox.objc.h 2>/dev/null | head -n 1)
+          SWIFT=clients/apple/Library/Network/ExtensionPlatformInterface.swift
+          if [ -z "$HDR" ]; then
+            echo "::error::binding header not found under Libbox.xcframework"
+            exit 1
+          fi
+          if ! grep -qF 'createAutoRedirectListener' "$HDR"; then
+            echo "binding does not require createAutoRedirectListener, no patch needed"
+            exit 0
+          fi
+          grep -nF 'createAutoRedirectListener' "$HDR"
+          if ! grep -qF 'createAutoRedirectListener:(BOOL)inet6 ret0_:' "$HDR"; then
+            echo "::error::unexpected createAutoRedirectListener signature, see the declaration above"
+            exit 1
+          fi
+          if grep -qF 'func createAutoRedirectListener' "$SWIFT"; then
+            echo "client already implements createAutoRedirectListener"
+            exit 0
+          fi
+          if ! grep -qF '    public func createAutoRedirect(' "$SWIFT"; then
+            echo "::error::insertion point 'createAutoRedirect' not found in $SWIFT"
+            exit 1
+          fi
+          STUB="$RUNNER_TEMP/auto-redirect-listener.swift"
+          {
+            echo '    // 风大内核为 Linux/Android 的自动重定向新增的接口方法，Apple 平台不会调用它。'
+            echo '    // 显式写出 Objective-C 选择器，避免受 Swift 导入命名规则影响。'
+            echo '    @objc(createAutoRedirectListener:ret0_:error:)'
+            echo '    public func createAutoRedirectListener(_: Bool, ret0_: UnsafeMutablePointer<Int32>?) throws {'
+            echo '        throw NSError(domain: "ExtensionPlatformInterface", code: -1, userInfo: ['
+            echo '            NSLocalizedDescriptionKey: "auto redirect is not supported on Apple platforms",'
+            echo '        ])'
+            echo '    }'
+            echo
+          } > "$STUB"
+          [ -s "$STUB" ] || { echo "::error::failed to write the stub file"; exit 1; }
+          export STUB
+          awk 'BEGIN { while ((getline line < ENVIRON["STUB"]) > 0) stub = stub line "\n" }
+               !inserted && index($0, "    public func createAutoRedirect(") == 1 { printf "%s", stub; inserted = 1 }
+               { print }' "$SWIFT" > "$SWIFT.patched"
+          mv "$SWIFT.patched" "$SWIFT"
+          grep -qF 'func createAutoRedirectListener' "$SWIFT" || { echo "::error::patch failed"; exit 1; }
+          echo "patched $SWIFT"
 
       - name: Update Apple project version
         run: go run -v ./cmd/internal/update_apple_version --ci
